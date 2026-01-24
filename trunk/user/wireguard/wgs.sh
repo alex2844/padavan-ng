@@ -81,9 +81,11 @@ _net_to_prefix()
 
 wg_setconf()
 {
-    local pass rnet rmsk prefix i rlan max peers nvram_modified
+    local pass rnet rmsk prefix i rlan max peers nvram_modified ipv6_prefix
 
     is_started || return 0
+
+    ipv6_prefix=$(ip -6 addr show dev ${IF_NAME} 2>/dev/null | grep -oE '([0-9a-f:]+)::[0-9a-f]+/[0-9]+' | grep -oE '([0-9a-f:]+)::' | head -n1)
 
     max="$(nvram get vpns_num_x)"
     for i in $(seq 0 $((max-1))); do
@@ -104,10 +106,18 @@ wg_setconf()
             rlan=", $rnet/$prefix"
         fi
 
+        local last_octet=$(nvram get vpns_addr_x$i)
+        local allowed_ips="$(nvram get vpns_vnet | sed 's/\.0$/./')${last_octet}/32${rlan}"
+
+        if [ -n "${ipv6_prefix}" ]; then
+            local ipv6_addr="${ipv6_prefix}${last_octet}/128"
+            allowed_ips="${allowed_ips}, ${ipv6_addr}"
+        fi
+
         peers=$(echo "[Peer]"
-                echo "PublicKey=$pass"
-                echo "AllowedIPs=$(nvram get vpns_vnet | sed 's/\.0$/./')$(nvram get vpns_addr_x$i)$rlan"
-                echo "$peers")
+                echo "PublicKey=${pass}"
+                echo "AllowedIPs=${allowed_ips}"
+                echo "${peers}")
     done
 
     [ "$nvram_modified" ] && nvram commit
@@ -173,7 +183,7 @@ wg_addclient()
 {
     # $1 - client name
 
-    local max nums free_num addr key config
+    local max nums free_num addr key config lan_ip
 
     max="$(nvram get vpns_num_x)"
     nums=$(for i in $(seq 0 $((max-1))); do
@@ -193,6 +203,9 @@ wg_addclient()
     addr="$(echo $IF_ADDR | sed 's/\.1$//').$free_num"
     key=$($WG genkey)
 
+    lan_ip=$(nvram get lan_ipaddr)
+    [ -z "${lan_ip}" ] && lan_ip="${IF_ADDR}"
+
     nvram set vpns_user_x$max=$name
     nvram set vpns_pass_x$max=$key
     nvram set vpns_public_x$max=$(echo $key | $WG pubkey)
@@ -206,9 +219,9 @@ wg_addclient()
 
     read -r -d '' config <<EOF
 [Interface]
-PrivateKey = $key
-Address = $addr
-DNS = 1.1.1.1,8.8.8.8,9.9.9.9,77.88.8.8
+PrivateKey = ${key}
+Address = ${addr}
+DNS = ${lan_ip}
 
 [Peer]
 PublicKey = $(echo $IF_PRIVATE | $WG pubkey)
@@ -295,21 +308,37 @@ wg_export()
 
     rm -f "$EXPORT_CONF"
 
+    local lan_ip=$(nvram get lan_ipaddr)
+    [ -z "${lan_ip}" ] && lan_ip="${IF_ADDR}"
+
+    local ipv6_prefix=$(ip -6 addr show dev ${IF_NAME} 2>/dev/null | grep -oE '([0-9a-f:]+)::[0-9a-f]+/[0-9]+' | grep -oE '([0-9a-f:]+)::' | head -n1)
+
     max="$(nvram get vpns_num_x)"
     for i in $(seq 0 $((max-1))); do
         [ ! "$(nvram get vpns_user_x$i)" == "$1" ] && continue
 
+        local addr="$(nvram get vpns_vnet | sed 's/\.0$/./')$(nvram get vpns_addr_x$i)"
+        local last_octet="$(nvram get vpns_addr_x$i)"
+
+        local address="${addr}/24"
+        local allowed_ips="0.0.0.0/0"
+        if [ -n "${ipv6_prefix}" ]; then
+            local ipv6_addr="${ipv6_prefix}${last_octet}/64"
+            address="${address}, ${ipv6_addr}"
+            allowed_ips="${allowed_ips}, ::/0"
+        fi
+
         tee "$EXPORT_CONF" <<EOF
 [Interface]
 PrivateKey = $(nvram get vpns_pass_x$i)
-Address = $(nvram get vpns_vnet | sed 's/\.0$/./')$(nvram get vpns_addr_x$i)/24
-DNS = 1.1.1.1,8.8.8.8,9.9.9.9,77.88.8.8
+Address = ${address}
+DNS = ${lan_ip}
 
 [Peer]
 PublicKey = $(nvram get vpns_wg_public)
 Endpoint = ${WAN_ADDR}:${PORT}
 PersistentKeepalive = 11
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = ${allowed_ips}
 EOF
     done
 
