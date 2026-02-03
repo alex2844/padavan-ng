@@ -79,13 +79,39 @@ _net_to_prefix()
     { print subnetmaskToPrefix($1) }'
 }
 
+_get_ipv6_prefix()
+{
+    local ipv6_enabled=$(nvram get ip6_service)
+    if [ -n "${ipv6_enabled}" ]; then
+        local ipv6_lan=$(nvram get ip6_lan_addr)
+        if [ -n "${ipv6_lan}" ]; then
+            echo "${ipv6_lan}" | sed -E 's/^([0-9a-f:]+)::[0-9a-f:]*$/\1::/'
+        fi
+    fi
+}
+
+_get_dns_servers()
+{
+    local val
+    local dns_servers=""
+    for var in dhcp_dns1_x dhcp_dns2_x dhcp_dns3_x dhcp_dnsv6_x; do
+        val=$(nvram get ${var})
+        [ -n "${val}" ] && dns_servers="${dns_servers}${dns_servers:+, }${val}"
+    done
+    if [ -z "${dns_servers}" ]; then
+        local lan_ip=$(nvram get lan_ipaddr)
+        dns_servers="${lan_ip:-${IF_ADDR}}"
+    fi
+    echo "${dns_servers}"
+}
+
 wg_setconf()
 {
     local pass rnet rmsk prefix i rlan max peers nvram_modified ipv6_prefix
 
     is_started || return 0
 
-    ipv6_prefix=$(ip -6 addr show dev ${IF_NAME} 2>/dev/null | grep -oE '([0-9a-f:]+)::[0-9a-f]+/[0-9]+' | grep -oE '([0-9a-f:]+)::' | head -n1)
+    ipv6_prefix=$(_get_ipv6_prefix)
 
     max="$(nvram get vpns_num_x)"
     for i in $(seq 0 $((max-1))); do
@@ -162,6 +188,11 @@ wg_start()
     ip link set dev $IF_NAME mtu $IF_MTU
     ip addr add ${IF_ADDR}/24 dev $IF_NAME
 
+    local ipv6_prefix=$(_get_ipv6_prefix)
+    if [ -n "${ipv6_prefix}" ]; then
+        ip -6 addr add ${ipv6_prefix}1/64 dev ${IF_NAME}
+    fi
+
     local if_ip=$(ip addr show dev $IF_NAME | awk '/inet/{print $2}')
     [ "$if_ip" ] || error "$IF_NAME interface address not set"
 
@@ -174,8 +205,14 @@ wg_start()
         die "$IF_NAME startup failed"
     fi
 
-    $WG show $IF_NAME allowed-ips | awk '$3 {print $3}' | while read i; do
-        ip route add $i dev $IF_NAME metric 1 || log "warning: unable to add route to $i"
+    $WG show $IF_NAME allowed-ips | awk 'NF > 1 {for(i=2; i<=NF; i++) print $i}' | while read addr; do
+        if echo "$addr" | grep -q ':'; then
+            ip -6 route add "$addr" dev $IF_NAME metric 1 2>/dev/null || \
+                log "warning: unable to add IPv6 route to $addr"
+        else
+            ip route add "$addr" dev $IF_NAME metric 1 2>/dev/null || \
+                log "warning: unable to add IPv4 route to $addr"
+        fi
     done
 }
 
@@ -183,7 +220,7 @@ wg_addclient()
 {
     # $1 - client name
 
-    local max nums free_num addr key config lan_ip
+    local max nums free_num addr key config
 
     max="$(nvram get vpns_num_x)"
     nums=$(for i in $(seq 0 $((max-1))); do
@@ -203,9 +240,6 @@ wg_addclient()
     addr="$(echo $IF_ADDR | sed 's/\.1$//').$free_num"
     key=$($WG genkey)
 
-    lan_ip=$(nvram get lan_ipaddr)
-    [ -z "${lan_ip}" ] && lan_ip="${IF_ADDR}"
-
     nvram set vpns_user_x$max=$name
     nvram set vpns_pass_x$max=$key
     nvram set vpns_public_x$max=$(echo $key | $WG pubkey)
@@ -217,17 +251,27 @@ wg_addclient()
 
     wg_setconf || return
 
+    local address="${addr}/24"
+    local allowed_ips="0.0.0.0/0"
+    local dns_servers="$(_get_dns_servers)"
+    local ipv6_prefix=$(_get_ipv6_prefix)
+    if [ -n "${ipv6_prefix}" ]; then
+        local ipv6_addr="${ipv6_prefix}${free_num}/64"
+        address="${address}, ${ipv6_addr}"
+        allowed_ips="${allowed_ips}, ::/0"
+    fi
+
     read -r -d '' config <<EOF
 [Interface]
 PrivateKey = ${key}
-Address = ${addr}
-DNS = ${lan_ip}
+Address = ${address}
+DNS = ${dns_servers}
 
 [Peer]
 PublicKey = $(echo $IF_PRIVATE | $WG pubkey)
 Endpoint = ${WAN_ADDR}:${PORT}
 PersistentKeepalive = 11
-AllowedIPs = 0.0.0.0/0
+AllowedIPs = ${allowed_ips}
 EOF
 
     if [ -x /usr/bin/qrencode ]; then
@@ -308,10 +352,7 @@ wg_export()
 
     rm -f "$EXPORT_CONF"
 
-    local lan_ip=$(nvram get lan_ipaddr)
-    [ -z "${lan_ip}" ] && lan_ip="${IF_ADDR}"
-
-    local ipv6_prefix=$(ip -6 addr show dev ${IF_NAME} 2>/dev/null | grep -oE '([0-9a-f:]+)::[0-9a-f]+/[0-9]+' | grep -oE '([0-9a-f:]+)::' | head -n1)
+    local ipv6_prefix=$(_get_ipv6_prefix)
 
     max="$(nvram get vpns_num_x)"
     for i in $(seq 0 $((max-1))); do
@@ -320,6 +361,7 @@ wg_export()
         local addr="$(nvram get vpns_vnet | sed 's/\.0$/./')$(nvram get vpns_addr_x$i)"
         local last_octet="$(nvram get vpns_addr_x$i)"
 
+        local dns_servers="$(_get_dns_servers)"
         local address="${addr}/24"
         local allowed_ips="0.0.0.0/0"
         if [ -n "${ipv6_prefix}" ]; then
@@ -332,7 +374,7 @@ wg_export()
 [Interface]
 PrivateKey = $(nvram get vpns_pass_x$i)
 Address = ${address}
-DNS = ${lan_ip}
+DNS = ${dns_servers}
 
 [Peer]
 PublicKey = $(nvram get vpns_wg_public)
